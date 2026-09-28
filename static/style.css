@@ -64,6 +64,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .saved-dot.saving { background: var(--amber); }
 .icon-button { height: 33px; width: 34px; border: 1px solid var(--line); background: transparent; border-radius: 3px; cursor: pointer; font-size: 17px; }
 .icon-button:hover { border-color: #a7b58d; background: #fff; }
+.icon-button:disabled { opacity: .4; cursor: not-allowed; }
 .button { min-height: 34px; padding: 0 12px; border-radius: 3px; border: 1px solid transparent; font-weight: 700; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; cursor: pointer; transition: transform .15s, background .15s, border .15s; white-space: nowrap; }
 .button:active { transform: translateY(1px); }
 .button-dark { color: white; background: var(--dark); }
@@ -246,6 +247,8 @@ h1 { margin-top: 9px; font-size: clamp(21px, 2.1vw, 28px); letter-spacing: 0; li
   .brand-mark { width: 27px; height: 27px; }
   .sidebar > .side-label, .sidebar > .nav-item, .sidebar > .side-divider, .sidebar > .model-list, .sidebar-bottom { display: none; }
   .sidebar > .side-label-row { display: flex; padding: 0; justify-self: end; }
+  .sidebar > .model-list { display: flex; grid-column: 1 / -1; max-width: 100%; overflow-x: auto; }
+  .model-list .model-link { flex: 0 0 160px; min-width: 0; }
   .main-area { padding: 0 20px; }
   .workspace-grid { grid-template-columns: minmax(0, 1fr); }
   .inspector-panel { min-height: 0; }

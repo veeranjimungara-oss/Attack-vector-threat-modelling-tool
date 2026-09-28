@@ -1,5 +1,5 @@
 const $ = (selector) => document.querySelector(selector);
-const state = { models: [], model: null, selected: null, connectMode: false, connectFrom: null, positions: new Map(), saveTimer: null };
+const state = { models: [], model: null, selected: null, connectMode: false, connectFrom: null, positions: new Map(), saveTimer: null, editingModelId: null };
 const typeLabels = { internet: "PUBLIC SURFACE", user: "IDENTITY", web: "WEB APPLICATION", api: "API SERVICE", auth: "IDENTITY SERVICE", database: "DATA STORE", cloud: "CLOUD SERVICE", network: "NETWORK DEVICE" };
 const typeIcons = { internet: "↗", user: "◉", web: "▤", api: "⌘", auth: "⎈", database: "▦", cloud: "☁", network: "⌁" };
 const strideLetters = { Spoofing: "S", Tampering: "T", Repudiation: "R", "Information Disclosure": "I", "Denial of Service": "D", "Elevation of Privilege": "E" };
@@ -170,6 +170,7 @@ function browserApi(path, options = {}) {
     return models[modelIndex];
   }
   if (method === "DELETE") {
+    if (models.length <= 1) throw new Error("Create another model before deleting the last one.");
     models.splice(modelIndex, 1);
     writeBrowserModels(models);
     return null;
@@ -231,6 +232,8 @@ function render() {
   $("#high-total").textContent = String(threats.filter((threat) => threat.level === "Critical" || threat.level === "High").length).padStart(2, "0");
   $("#tab-threat-count").textContent = threats.length;
   $("#sidebar-threat-count").textContent = threats.length;
+  $("#model-delete-button").disabled = state.models.length <= 1;
+  $("#model-delete-button").title = state.models.length <= 1 ? "Create another model before deleting this one" : "Delete model";
   $("#finding-count").textContent = threats.length;
   $("#asset-count-footer").textContent = `${nodes.length} NODES · ${edges.length} TRUST PATHS`;
   const categories = new Set(threats.map((threat) => threat.category));
@@ -405,23 +408,35 @@ function switchView(view) {
   const threats = view === "threats";
   $("#architecture-view").hidden = threats;
   $("#threat-view").hidden = !threats;
-  document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("selected", button.dataset.view === view));
+  document.querySelectorAll("[data-view]").forEach((button) => {
+    const activeClass = button.classList.contains("nav-item") ? "active" : "selected";
+    button.classList.toggle(activeClass, button.dataset.view === view);
+  });
 }
 
 function scheduleSave() {
   $("#save-label").textContent = "SAVING CHANGES…";
   $(".saved-dot").classList.add("saving");
   render();
+  const modelId = state.model.id;
+  const body = JSON.stringify({ name: state.model.name, description: state.model.description, architecture: state.model.architecture });
   clearTimeout(state.saveTimer);
   state.saveTimer = setTimeout(async () => {
     try {
-      state.model = await api(`/api/models/${state.model.id}`, { method: "PUT", body: JSON.stringify(state.model) });
-      $("#save-label").textContent = "ALL CHANGES SAVED";
-      $(".saved-dot").classList.remove("saving");
-      render();
+      const saved = await api(`/api/models/${modelId}`, { method: "PUT", body });
+      state.models = state.models.map((model) => model.id === modelId ? saved : model);
+      if (state.model?.id === modelId) {
+        state.model = saved;
+        $("#save-label").textContent = "ALL CHANGES SAVED";
+        $(".saved-dot").classList.remove("saving");
+        render();
+      }
     } catch (error) {
-      $("#save-label").textContent = "SAVE FAILED";
-      showToast(error.message);
+      if (state.model?.id === modelId) {
+        $("#save-label").textContent = "SAVE FAILED";
+        $(".saved-dot").classList.remove("saving");
+        showToast(error.message);
+      }
     }
   }, 450);
 }
@@ -450,18 +465,60 @@ function setupDialogs() {
     event.preventDefault();
     const name = $("#model-name-input").value.trim();
     if (!name) return;
+    const editingId = state.editingModelId;
+    const payload = { name, description: $("#model-description-input").value.trim(), architecture: editingId ? state.model.architecture : { nodes: [], edges: [] } };
     try {
-      state.model = await api("/api/models", { method: "POST", body: JSON.stringify({ name, description: $("#model-description-input").value.trim(), architecture: { nodes: [], edges: [] } }) });
-      state.models.unshift(state.model);
-      state.selected = null;
-      state.positions.clear();
+      const saved = await api(editingId ? `/api/models/${editingId}` : "/api/models", { method: editingId ? "PUT" : "POST", body: JSON.stringify(payload) });
+      if (editingId) {
+        state.models = state.models.map((model) => model.id === saved.id ? saved : model);
+      } else {
+        state.models.unshift(saved);
+        state.selected = null;
+        state.positions.clear();
+      }
+      state.model = saved;
+      state.editingModelId = null;
       $("#model-form").reset();
       $("#model-dialog").close();
       switchView("model");
       render();
-      showToast("Threat model created");
+      showToast(editingId ? "Model details updated" : "Threat model created");
     } catch (error) { showToast(error.message); }
   });
+}
+
+function openCreateModel() {
+  state.editingModelId = null;
+  $("#model-dialog-title").textContent = "Create threat model";
+  $("#model-form-submit").textContent = "Create model";
+  $("#model-form").reset();
+  openModal($("#model-dialog"), $("#model-name-input"));
+}
+
+function openEditModel() {
+  if (!state.model) return;
+  state.editingModelId = state.model.id;
+  $("#model-dialog-title").textContent = "Edit model details";
+  $("#model-form-submit").textContent = "Save changes";
+  $("#model-name-input").value = state.model.name;
+  $("#model-description-input").value = state.model.description || "";
+  openModal($("#model-dialog"), $("#model-name-input"));
+}
+
+async function deleteCurrentModel() {
+  if (!state.model || state.models.length <= 1) return;
+  if (!window.confirm(`Delete “${state.model.name}” and its architecture? This cannot be undone.`)) return;
+  const modelId = state.model.id;
+  clearTimeout(state.saveTimer);
+  try {
+    await api(`/api/models/${modelId}`, { method: "DELETE" });
+    state.models = state.models.filter((model) => model.id !== modelId);
+    state.model = state.models[0] || null;
+    state.selected = null;
+    state.positions.clear();
+    render();
+    showToast("Threat model deleted");
+  } catch (error) { showToast(error.message); }
 }
 
 function exportJson() {
@@ -476,7 +533,9 @@ function setup() {
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
   $("#add-asset").addEventListener("click", () => openModal($("#asset-dialog"), $("#asset-name")));
   $("#empty-add").addEventListener("click", () => openModal($("#asset-dialog"), $("#asset-name")));
-  $("#new-model-side").addEventListener("click", () => openModal($("#model-dialog"), $("#model-name-input")));
+  $("#new-model-side").addEventListener("click", openCreateModel);
+  $("#model-edit-button").addEventListener("click", openEditModel);
+  $("#model-delete-button").addEventListener("click", deleteCurrentModel);
   $("#connect-mode").addEventListener("click", () => { state.connectMode = !state.connectMode; state.connectFrom = null; $("#connect-mode").classList.toggle("active", state.connectMode); renderGraph(); });
   $("#clear-selection").addEventListener("click", () => { state.selected = null; renderGraph(); renderInspector(); });
   $("#severity-filter").addEventListener("change", renderThreats);

@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,10 +24,18 @@ ASSET_TYPES = {
 }
 
 
+@contextmanager
 def connect_db():
     connection = sqlite3.connect(DATABASE)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def seed_architecture():
@@ -48,6 +57,7 @@ def seed_architecture():
 
 
 def init_db():
+    DATABASE.parent.mkdir(parents=True, exist_ok=True)
     with connect_db() as connection:
         connection.execute(
             """CREATE TABLE IF NOT EXISTS models (
@@ -69,6 +79,73 @@ def init_db():
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+
+
+def validate_architecture(value):
+    if not isinstance(value, dict):
+        raise ValueError("Architecture must be an object.")
+    nodes = value.get("nodes", [])
+    edges = value.get("edges", [])
+    if not isinstance(nodes, list) or len(nodes) > 200:
+        raise ValueError("Architecture must contain no more than 200 assets.")
+    if not isinstance(edges, list) or len(edges) > 500:
+        raise ValueError("Architecture must contain no more than 500 trust paths.")
+
+    normalized_nodes = []
+    node_ids = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError("Each asset must be an object.")
+        node_id = node.get("id")
+        name = node.get("name")
+        asset_type = node.get("type")
+        if not isinstance(node_id, str) or not node_id.strip() or len(node_id) > 80:
+            raise ValueError("Each asset must have a valid ID no longer than 80 characters.")
+        node_id = node_id.strip()
+        if node_id in node_ids:
+            raise ValueError(f"Duplicate asset ID: {node_id}.")
+        if not isinstance(name, str) or not name.strip() or len(name) > 100:
+            raise ValueError("Each asset must have a name no longer than 100 characters.")
+        if not isinstance(asset_type, str) or asset_type not in ASSET_TYPES:
+            raise ValueError(f"Unsupported asset type for {name.strip()}.")
+        node_ids.add(node_id)
+        normalized_nodes.append({"id": node_id, "name": name.strip(), "type": asset_type})
+
+    normalized_edges = []
+    edge_pairs = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            raise ValueError("Each trust path must be an object.")
+        source = edge.get("from")
+        target = edge.get("to")
+        if not isinstance(source, str) or not isinstance(target, str) or source not in node_ids or target not in node_ids:
+            raise ValueError("Trust paths must reference existing assets.")
+        pair = (source, target)
+        if pair in edge_pairs:
+            raise ValueError("Duplicate trust paths are not allowed.")
+        edge_pairs.add(pair)
+        normalized_edges.append({"from": source, "to": target})
+
+    return {"nodes": normalized_nodes, "edges": normalized_edges}
+
+
+def validate_model_payload(data):
+    if not isinstance(data, dict):
+        raise ValueError("Request body must be a JSON object.")
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("A model name is required.")
+    if len(name.strip()) > 100:
+        raise ValueError("Model name must be no longer than 100 characters.")
+    description = data.get("description", "")
+    if not isinstance(description, str) or len(description) > 500:
+        raise ValueError("Description must be text no longer than 500 characters.")
+    architecture = validate_architecture(data.get("architecture", {"nodes": [], "edges": []}))
+    return name.strip(), description.strip(), architecture
+
+
+def validation_error(error):
+    return jsonify({"error": str(error)}), 400
 
 
 def serialize_model(row):
@@ -181,14 +258,14 @@ def list_models():
 @app.post("/api/models")
 def create_model():
     data = request.get_json(silent=True) or {}
-    name = str(data.get("name", "")).strip()
-    if not name:
-        return jsonify({"error": "A model name is required."}), 400
-    architecture = data.get("architecture") or {"nodes": [], "edges": []}
+    try:
+        name, description, architecture = validate_model_payload(data)
+    except ValueError as error:
+        return validation_error(error)
     with connect_db() as connection:
         cursor = connection.execute(
             "INSERT INTO models (name, description, architecture, updated_at) VALUES (?, ?, ?, ?)",
-            (name[:100], str(data.get("description", ""))[:500], json.dumps(architecture), datetime.now(timezone.utc).isoformat()),
+            (name, description, json.dumps(architecture), datetime.now(timezone.utc).isoformat()),
         )
         row = connection.execute("SELECT * FROM models WHERE id = ?", (cursor.lastrowid,)).fetchone()
     return jsonify(serialize_model(row)), 201
@@ -206,13 +283,14 @@ def get_model(model_id):
 @app.put("/api/models/<int:model_id>")
 def update_model(model_id):
     data = request.get_json(silent=True) or {}
-    name = str(data.get("name", "")).strip()
-    if not name:
-        return jsonify({"error": "A model name is required."}), 400
+    try:
+        name, description, architecture = validate_model_payload(data)
+    except ValueError as error:
+        return validation_error(error)
     with connect_db() as connection:
         result = connection.execute(
             "UPDATE models SET name = ?, description = ?, architecture = ?, updated_at = ? WHERE id = ?",
-            (name[:100], str(data.get("description", ""))[:500], json.dumps(data.get("architecture", {"nodes": [], "edges": []})), datetime.now(timezone.utc).isoformat(), model_id),
+            (name, description, json.dumps(architecture), datetime.now(timezone.utc).isoformat(), model_id),
         )
         row = connection.execute("SELECT * FROM models WHERE id = ?", (model_id,)).fetchone()
     if result.rowcount == 0:
@@ -223,6 +301,12 @@ def update_model(model_id):
 @app.delete("/api/models/<int:model_id>")
 def delete_model(model_id):
     with connect_db() as connection:
+        exists = connection.execute("SELECT 1 FROM models WHERE id = ?", (model_id,)).fetchone()
+        if exists is None:
+            return jsonify({"error": "Model not found."}), 404
+        count = connection.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+        if count <= 1:
+            return jsonify({"error": "Create another model before deleting the last one."}), 409
         result = connection.execute("DELETE FROM models WHERE id = ?", (model_id,))
     if result.rowcount == 0:
         return jsonify({"error": "Model not found."}), 404
