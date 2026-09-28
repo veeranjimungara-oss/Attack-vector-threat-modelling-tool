@@ -3,8 +3,182 @@ const state = { models: [], model: null, selected: null, connectMode: false, con
 const typeLabels = { internet: "PUBLIC SURFACE", user: "IDENTITY", web: "WEB APPLICATION", api: "API SERVICE", auth: "IDENTITY SERVICE", database: "DATA STORE", cloud: "CLOUD SERVICE", network: "NETWORK DEVICE" };
 const typeIcons = { internet: "↗", user: "◉", web: "▤", api: "⌘", auth: "⎈", database: "▦", cloud: "☁", network: "⌁" };
 const strideLetters = { Spoofing: "S", Tampering: "T", Repudiation: "R", "Information Disclosure": "I", "Denial of Service": "D", "Elevation of Privilege": "E" };
+const browserStorageMode = location.hostname.endsWith(".github.io") || new URLSearchParams(location.search).has("static");
+const browserModelsKey = "vector-threat-models-v1";
+
+function analyzeInBrowser(architecture) {
+  const nodes = architecture.nodes || [];
+  const edges = architecture.edges || [];
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  const incoming = new Map(nodes.map((node) => [node.id, []]));
+  const outgoing = new Map(nodes.map((node) => [node.id, []]));
+  edges.forEach((edge) => {
+    if (outgoing.has(edge.from) && incoming.has(edge.to)) {
+      outgoing.get(edge.from).push(edge.to);
+      incoming.get(edge.to).push(edge.from);
+    }
+  });
+  const internetReachable = (nodeId) => {
+    const pending = [nodeId];
+    const visited = new Set();
+    while (pending.length) {
+      const current = pending.pop();
+      if (visited.has(current)) continue;
+      visited.add(current);
+      if (nodesById.get(current)?.type === "internet") return true;
+      pending.push(...(incoming.get(current) || []));
+    }
+    return false;
+  };
+  const threats = [];
+  const add = (node, title, category, likelihood, impact, vector, mitigation) => {
+    const score = likelihood * impact;
+    const level = score >= 17 ? "Critical" : score >= 10 ? "High" : score >= 5 ? "Medium" : "Low";
+    threats.push({ id: `${node.id}:${title}`, asset: node.name, asset_id: node.id, title, category, likelihood, impact, score, level, vector, mitigation });
+  };
+
+  for (const node of nodes) {
+    const kind = node.type;
+    const exposed = internetReachable(node.id);
+    if (["web", "api"].includes(kind)) {
+      add(node, "Injection through untrusted input", "Tampering", exposed ? 3 : 2, 4,
+        "User-controlled values reaching a query or command boundary.",
+        ["Use parameterized queries and safe APIs", "Validate input against an allowlist", "Add security tests for every data boundary"]);
+      add(node, "Cross-site scripting", "Information Disclosure", exposed ? 3 : 2, 3,
+        "Untrusted content rendered in a browser context.",
+        ["Encode output for its rendering context", "Apply a restrictive Content Security Policy", "Sanitize rich text with a maintained library"]);
+      add(node, "Service exhaustion", "Denial of Service", exposed ? 3 : 2, 4,
+        "High-volume requests or expensive operations consume service capacity.",
+        ["Set request and payload limits", "Use rate limits and upstream protection", "Define timeouts and capacity alerts"]);
+      add(node, "Privilege escalation through weak authorization", "Elevation of Privilege", exposed ? 3 : 2, 4,
+        "An authenticated user or compromised service may reach actions beyond its intended role.",
+        ["Authorize every request at the resource boundary", "Apply least privilege to users and service identities", "Test role and tenant isolation"]);
+    }
+    if (["web", "api", "auth", "database", "cloud"].includes(kind)) {
+      add(node, "Insufficient audit trail", "Repudiation", 2, 3,
+        "Missing or mutable event records make sensitive actions difficult to attribute.",
+        ["Record actor, action, target, and timestamp", "Centralize and protect security logs from alteration", "Alert on gaps in critical audit events"]);
+    }
+    if (["auth", "user"].includes(kind)) {
+      add(node, "Credential guessing or reuse", "Spoofing", exposed ? 4 : 3, 4,
+        "Weak, reused, or repeatedly guessed credentials.",
+        ["Require MFA for sensitive access", "Rate-limit authentication attempts", "Screen passwords against known compromised values"]);
+      add(node, "Session or token theft", "Spoofing", exposed ? 2 : 1, 5,
+        "A stolen bearer token may impersonate a legitimate identity.",
+        ["Use short-lived, audience-bound tokens", "Rotate refresh tokens and revoke sessions", "Protect cookies with Secure, HttpOnly, and SameSite"]);
+    }
+    if (kind === "database") {
+      add(node, "Sensitive data exposure", "Information Disclosure", exposed ? 3 : 2, 5,
+        "Sensitive records may be read through an internet-reachable service path or an exposed data store.",
+        ["Keep the database on a private network", "Encrypt sensitive data at rest and in transit", "Use a least-privilege database account"]);
+      add(node, "Unauthorized record changes", "Tampering", 2, 4,
+        "A compromised upstream identity or service could alter stored records.",
+        ["Scope database permissions to required operations", "Audit high-risk data changes", "Back up data and test restoration"]);
+    }
+    if (["cloud", "network"].includes(kind)) {
+      add(node, "Misconfiguration exposes a resource", "Information Disclosure", 3, 4,
+        "An overly broad network rule, policy, or storage permission exposes the asset.",
+        ["Use private-by-default network policies", "Continuously review effective permissions", "Alert on public exposure changes"]);
+    }
+    if (kind !== "internet" && outgoing.get(node.id)?.length) {
+      add(node, "Untrusted downstream response", "Tampering", 2, 3,
+        "A downstream dependency can return unexpected or manipulated data.",
+        ["Authenticate and validate service-to-service traffic", "Validate response schemas", "Apply timeouts and dependency failure handling"]);
+    }
+  }
+  return threats.sort((left, right) => right.score - left.score);
+}
+
+function readBrowserModels() {
+  const saved = localStorage.getItem(browserModelsKey);
+  if (saved !== null) {
+    return JSON.parse(saved).map((model) => ({ ...model, threats: analyzeInBrowser(model.architecture) }));
+  }
+  const architecture = {
+    nodes: [
+      { id: "internet", name: "Public internet", type: "internet" },
+      { id: "portal", name: "Customer portal", type: "web" },
+      { id: "identity", name: "Auth API", type: "auth" },
+      { id: "core-api", name: "Core API", type: "api" },
+      { id: "customer-db", name: "Customer data", type: "database" },
+    ],
+    edges: [
+      { from: "internet", to: "portal" },
+      { from: "portal", to: "identity" },
+      { from: "portal", to: "core-api" },
+      { from: "core-api", to: "customer-db" },
+    ],
+  };
+  const models = [{
+    id: 1,
+    name: "Northstar customer platform",
+    description: "Customer-facing services and their data boundaries.",
+    architecture,
+    updated_at: new Date().toISOString(),
+    threats: analyzeInBrowser(architecture),
+  }];
+  localStorage.setItem(browserModelsKey, JSON.stringify(models));
+  return models;
+}
+
+function writeBrowserModels(models) {
+  localStorage.setItem(browserModelsKey, JSON.stringify(models));
+}
+
+function browserApi(path, options = {}) {
+  const method = options.method || "GET";
+  const data = options.body ? JSON.parse(options.body) : {};
+  const models = readBrowserModels();
+  if (path === "/api/models" && method === "GET") {
+    return models.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+  }
+  if (path === "/api/models" && method === "POST") {
+    const name = String(data.name || "").trim();
+    if (!name) throw new Error("A model name is required.");
+    const architecture = data.architecture || { nodes: [], edges: [] };
+    const model = {
+      id: Math.max(0, ...models.map((item) => item.id)) + 1,
+      name: name.slice(0, 100),
+      description: String(data.description || "").slice(0, 500),
+      architecture,
+      updated_at: new Date().toISOString(),
+      threats: analyzeInBrowser(architecture),
+    };
+    models.push(model);
+    writeBrowserModels(models);
+    return model;
+  }
+  const match = path.match(/^\/api\/models\/(\d+)$/);
+  if (!match) throw new Error("Not found.");
+  const modelId = Number(match[1]);
+  const modelIndex = models.findIndex((item) => item.id === modelId);
+  if (modelIndex < 0) throw new Error("Model not found.");
+  if (method === "GET") return models[modelIndex];
+  if (method === "PUT") {
+    const name = String(data.name || "").trim();
+    if (!name) throw new Error("A model name is required.");
+    const architecture = data.architecture || { nodes: [], edges: [] };
+    models[modelIndex] = {
+      ...models[modelIndex],
+      name: name.slice(0, 100),
+      description: String(data.description || "").slice(0, 500),
+      architecture,
+      updated_at: new Date().toISOString(),
+      threats: analyzeInBrowser(architecture),
+    };
+    writeBrowserModels(models);
+    return models[modelIndex];
+  }
+  if (method === "DELETE") {
+    models.splice(modelIndex, 1);
+    writeBrowserModels(models);
+    return null;
+  }
+  throw new Error("Method not allowed.");
+}
 
 async function api(path, options = {}) {
+  if (browserStorageMode) return browserApi(path, options);
   const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
